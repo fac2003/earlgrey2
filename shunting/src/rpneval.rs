@@ -202,6 +202,7 @@ fn eval_fn(fname: &str, args: &[f64]) -> Result<f64, String> {
         "atan2" if args.len() == 2 => args[0].atan2(args[1]),
         "cos" if args.len() == 1 => args[0].cos(),
         "log" if args.len() == 1 => args[0].log10(),
+        "ln" if args.len() == 1 => args[0].ln(),
         "max" if !args.is_empty() => args.iter().fold(args[0], |a, &b| a.max(b)),
         "min" if !args.is_empty() => args.iter().fold(args[0], |a, &b| a.min(b)),
         // Order not important
