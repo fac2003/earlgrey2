@@ -20,6 +20,10 @@ pub struct EarleyForest<'a, ASTNode: Clone> {
     // Per-tree walk step cap overriding MAX_EVAL_ONE_STEPS. `None` keeps
     // the built-in safety net; `Some(n)` lets callers tighten or relax it.
     max_steps_per_tree: Option<usize>,
+    // Per-rule priorities (keyed by canonical `"head -> sym1 sym2 ..."`).
+    // Unset rules default to 0. Higher wins when competing parses of the
+    // same constituent are both derivable.
+    priorities: HashMap<String, i32>,
 }
 
 impl<'a, ASTNode: Clone> EarleyForest<'a, ASTNode> {
@@ -28,6 +32,7 @@ impl<'a, ASTNode: Clone> EarleyForest<'a, ASTNode> {
             actions: HashMap::new(),
             terminal_parser: Box::new(terminal_parser),
             max_steps_per_tree: None,
+            priorities: HashMap::new(),
         }
     }
 
@@ -44,6 +49,73 @@ impl<'a, ASTNode: Clone> EarleyForest<'a, ASTNode> {
         self.max_steps_per_tree = Some(max);
         self
     }
+
+    /// Assign a priority to a rule by its canonical string form
+    /// (e.g. `"expr -> ( expr )"`). When competing parses of the same
+    /// constituent are derivable, only the highest-priority alternative
+    /// is enumerated. Unset rules share the default priority of 0.
+    pub fn rule_priority(&mut self, rule: &str, priority: i32) -> &mut Self {
+        self.priorities.insert(rule.to_string(), priority);
+        self
+    }
+}
+
+fn source_priority(src: &SpanSource, priorities: &HashMap<String, i32>) -> i32 {
+    match src {
+        // A Completion "picks" a child production — score it by the
+        // trigger's rule. `Scan` sources don't represent a rule choice,
+        // so they share the default priority.
+        SpanSource::Completion(_, trigger) => priorities
+            .get(&trigger.rule.to_string())
+            .copied()
+            .unwrap_or(0),
+        SpanSource::Scan(_, _) => 0,
+    }
+}
+
+fn eligible_source_indices(span: &Rc<Span>, priorities: &HashMap<String, i32>) -> Vec<usize> {
+    let sources = span.sources();
+    if sources.is_empty() {
+        return Vec::new();
+    }
+    if priorities.is_empty() {
+        return (0..sources.len()).collect();
+    }
+    let mut best: Option<i32> = None;
+    let mut scored: Vec<(usize, i32)> = Vec::with_capacity(sources.len());
+    for (idx, src) in sources.iter().enumerate() {
+        let p = source_priority(src, priorities);
+        best = Some(best.map_or(p, |b| b.max(p)));
+        scored.push((idx, p));
+    }
+    let best = best.unwrap();
+    scored
+        .into_iter()
+        .filter(|(_, p)| *p == best)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn eligible_roots(
+    roots: &[Rc<Span>],
+    priorities: &HashMap<String, i32>,
+) -> Vec<Rc<Span>> {
+    if priorities.is_empty() || roots.is_empty() {
+        return roots.to_vec();
+    }
+    let mut best: Option<i32> = None;
+    let mut scored: Vec<(Rc<Span>, i32)> = Vec::with_capacity(roots.len());
+    for r in roots {
+        let p = priorities.get(&r.rule.to_string()).copied().unwrap_or(0);
+        best = Some(best.map_or(p, |b| b.max(p)));
+        scored.push((r.clone(), p));
+    }
+    let best = best.unwrap();
+    scored
+        .into_iter()
+        .filter(|(_, p)| *p == best)
+        .map(|(r, _)| r)
+        .collect()
 }
 
 impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
@@ -171,28 +243,35 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
 }
 
 struct ForestIterator {
-    // A stack of (span, current-source-idx).
-    // Each time the iterator is advanced we advance the source-idx for the top span.
-    // When that span exhausted all sources, we pop the top span. This results in a
-    // reset if it ever comes back from a different path. At the same time advance
-    // the new top-of-stack span. If this one is exhausted, then rinse, repeat.
-    source_idx: Vec<(Rc<Span>, usize)>,
+    // A stack of (span, position-in-eligible-list, cached-eligible-indices).
+    // `eligible` is the filtered subset of `span.sources()` indices that the
+    // priority filter retained — computed once per first-visit. `position`
+    // advances over `eligible`; the index fed to `eval_one` is
+    // `eligible[position]`. When `position + 1 == eligible.len()` the span
+    // is exhausted and gets popped during `advance`.
+    source_idx: Vec<(Rc<Span>, usize, Vec<usize>)>,
 }
 
 impl ForestIterator {
-    fn source_index(&mut self, cursor: &Rc<Span>) -> usize {
-        if let Some(itidx) = self.source_idx.iter().find(|s| s.0 == *cursor) {
-            itidx.1
+    fn source_index(
+        &mut self,
+        cursor: &Rc<Span>,
+        priorities: &HashMap<String, i32>,
+    ) -> usize {
+        if let Some(entry) = self.source_idx.iter().find(|s| s.0 == *cursor) {
+            entry.2[entry.1]
         } else {
-            self.source_idx.push((cursor.clone(), 0));
-            0
+            let eligible = eligible_source_indices(cursor, priorities);
+            let first = eligible[0];
+            self.source_idx.push((cursor.clone(), 0, eligible));
+            first
         }
     }
 
     fn advance(&mut self) -> bool {
-        while let Some((span, idx)) = self.source_idx.pop() {
-            if idx + 1 < span.sources().len() {
-                self.source_idx.push((span, idx + 1));
+        while let Some((span, pos, eligible)) = self.source_idx.pop() {
+            if pos + 1 < eligible.len() {
+                self.source_idx.push((span, pos + 1, eligible));
                 return true;
             }
         }
@@ -295,8 +374,21 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
     }
 
     pub fn eval(&self, ptrees: &ParseTrees) -> Result<ASTNode, String> {
-        let root = ptrees.0.first().expect("BUG: ParseTrees empty").clone();
-        self.eval_one(root, |_| 0)
+        // Honor priorities even for the single-tree path: pick the first
+        // eligible root, and at each ambiguous span pick the first
+        // priority-eligible source.
+        let roots = eligible_roots(&ptrees.0, &self.priorities);
+        let root = roots
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| ptrees.0.first().expect("BUG: ParseTrees empty").clone());
+        let priorities = &self.priorities;
+        self.eval_one(root, |s| {
+            eligible_source_indices(s, priorities)
+                .into_iter()
+                .next()
+                .unwrap_or(0)
+        })
     }
 
     pub fn eval_all(&self, ptrees: &ParseTrees) -> Result<Vec<ASTNode>, String> {
@@ -327,9 +419,10 @@ impl<'a, ASTNode: Clone> EarleyForest<'a, ASTNode> {
     where
         'a: 's,
     {
+        let roots = eligible_roots(&ptrees.0, &self.priorities);
         EarleyForestIter {
             forest: self,
-            roots: ptrees.0.clone().into_iter(),
+            roots: roots.into_iter(),
             state: None,
             done: false,
         }
@@ -380,9 +473,10 @@ impl<'f, 'a: 'f, ASTNode: Clone> Iterator for EarleyForestIter<'f, 'a, ASTNode> 
                 continue;
             }
             let root_clone = st.0.clone();
+            let priorities = &self.forest.priorities;
             let result = self
                 .forest
-                .eval_one(root_clone, |s| st.1.source_index(s));
+                .eval_one(root_clone, |s| st.1.source_index(s, priorities));
             self.state = Some(st);
             match result {
                 Err(e) => {
