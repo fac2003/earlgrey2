@@ -544,6 +544,102 @@ fn eval_iter_is_fused_after_error() {
 }
 
 #[test]
+fn rule_priority_baseline_no_effect() {
+    // Without any priorities set, an ambiguous grammar enumerates the full
+    // forest exactly as before phase 4.
+    let grammar = GrammarBuilder::default()
+        .nonterm("E")
+        .terminal("+", |n| n == "+")
+        .terminal("n", |n| "1234567890".contains(n))
+        .rule("E", &["E", "+", "E"])
+        .rule("E", &["n"])
+        .into_grammar("E")
+        .expect("Bad grammar");
+    let p = EarleyParser::new(grammar.clone());
+    let pout = p.parse("0 + 1 + 2 + 3 + 4 + 5".split_whitespace()).unwrap();
+    let ef = tree_evaler(grammar);
+    assert_eq!(ef.eval_all(&pout).unwrap().len(), 42);
+}
+
+#[test]
+fn rule_priority_collapses_unmatched_paren() {
+    // expr -> int
+    //       | '(' expr ')'   @prio 10  (matched — winner)
+    //       | '(' expr       @prio 1   (unmatched open)
+    //       | expr ')'       @prio 1   (unmatched close)
+    // Input "( 1 )" has three derivations at the root; priorities collapse
+    // the forest to just the matched one.
+    let grammar = GrammarBuilder::default()
+        .nonterm("expr")
+        .terminal("(", |n| n == "(")
+        .terminal(")", |n| n == ")")
+        .terminal("int", |n| n.chars().all(|c| "0123456789".contains(c)))
+        .rule("expr", &["int"])
+        .rule("expr", &["(", "expr", ")"])
+        .rule("expr", &["(", "expr"])
+        .rule("expr", &["expr", ")"])
+        .into_grammar("expr")
+        .expect("Bad grammar");
+    let p = EarleyParser::new(grammar.clone());
+    let pout = p.parse("( 1 )".split_whitespace()).unwrap();
+
+    let ef_plain = tree_evaler(grammar.clone());
+    assert!(
+        ef_plain.eval_all(&pout).unwrap().len() >= 2,
+        "unmatched-paren grammar should be ambiguous without priorities"
+    );
+
+    let mut ef = tree_evaler(grammar);
+    ef.rule_priority("expr -> ( expr )", 10);
+    ef.rule_priority("expr -> ( expr", 1);
+    ef.rule_priority("expr -> expr )", 1);
+    assert_eq!(
+        ef.eval_all(&pout).unwrap().len(),
+        1,
+        "priorities should collapse unmatched-paren ambiguity to one tree"
+    );
+}
+
+#[test]
+fn rule_priority_filters_within_span() {
+    // S -> expr '$' is unambiguous at the top; ambiguity is one level deeper.
+    // Priorities attached to inner-`expr` rules must still collapse the forest
+    // by filtering Completion backpointers within the outer span.
+    let grammar = GrammarBuilder::default()
+        .nonterm("S")
+        .nonterm("expr")
+        .terminal("$", |n| n == "$")
+        .terminal("(", |n| n == "(")
+        .terminal(")", |n| n == ")")
+        .terminal("int", |n| n.chars().all(|c| "0123456789".contains(c)))
+        .rule("S", &["expr", "$"])
+        .rule("expr", &["int"])
+        .rule("expr", &["(", "expr", ")"])
+        .rule("expr", &["(", "expr"])
+        .rule("expr", &["expr", ")"])
+        .into_grammar("S")
+        .expect("Bad grammar");
+    let p = EarleyParser::new(grammar.clone());
+    let pout = p.parse("( 1 ) $".split_whitespace()).unwrap();
+
+    let ef_plain = tree_evaler(grammar.clone());
+    assert!(
+        ef_plain.eval_all(&pout).unwrap().len() >= 2,
+        "baseline should be ambiguous at the inner expr"
+    );
+
+    let mut ef = tree_evaler(grammar);
+    ef.rule_priority("expr -> ( expr )", 10);
+    ef.rule_priority("expr -> ( expr", 1);
+    ef.rule_priority("expr -> expr )", 1);
+    assert_eq!(
+        ef.eval_all(&pout).unwrap().len(),
+        1,
+        "within-span priority filter must collapse the inner ambiguity"
+    );
+}
+
+#[test]
 fn trigger_has_multiple_bp() {
     // E -> E + n | n + E | n
     // SpanSource::Completion has multiple sources.
