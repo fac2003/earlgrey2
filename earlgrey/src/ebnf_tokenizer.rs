@@ -68,6 +68,17 @@ impl<I: Iterator<Item = char>> EbnfTokenizer<I> {
                 }
                 Ok(Some(id))
             }
+            // Digit runs (used by priority annotations: `@prio ( 10 )`).
+            Some(x) if x.is_ascii_digit() => {
+                let mut num = x.to_string();
+                while let Some(ch) = self.input.peek() {
+                    if !ch.is_ascii_digit() {
+                        break;
+                    }
+                    num.push(self.input.next().unwrap());
+                }
+                Ok(Some(num))
+            }
             // Swallow whitespace.
             Some(x) if x.is_whitespace() => {
                 while let Some(ws) = self.input.peek() {
@@ -136,5 +147,16 @@ mod tests {
         for (idx, token) in EbnfTokenizer::new(input.chars()).enumerate() {
             assert_eq!(token, expected[idx]);
         }
+    }
+
+    #[test]
+    fn priority_annotation() {
+        // `@prio(10)` is tokenized as `@prio`, `(`, `10`, `)`.
+        let input = r#"expr := foo @prio(10) | bar ;"#;
+        let expected = vec![
+            "expr", ":=", "foo", "@prio", "(", "10", ")", "|", "bar", ";",
+        ];
+        let toks: Vec<_> = EbnfTokenizer::new(input.chars()).collect();
+        assert_eq!(toks, expected);
     }
 }

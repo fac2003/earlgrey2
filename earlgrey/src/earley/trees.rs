@@ -1,5 +1,6 @@
 #![deny(warnings)]
 
+use super::grammar::Grammar;
 use super::parser::ParseTrees;
 use super::spans::{Span, SpanSource};
 use std::collections::HashMap;
@@ -56,6 +57,16 @@ impl<'a, ASTNode: Clone> EarleyForest<'a, ASTNode> {
     /// is enumerated. Unset rules share the default priority of 0.
     pub fn rule_priority(&mut self, rule: &str, priority: i32) -> &mut Self {
         self.priorities.insert(rule.to_string(), priority);
+        self
+    }
+
+    /// Copy any `rule_priorities` that were attached to the grammar
+    /// (typically via EBNF `@prio(N)` annotations) into this forest's
+    /// priority map. Existing entries with the same key are overwritten.
+    pub fn with_priorities_from(&mut self, grammar: &Grammar) -> &mut Self {
+        for (rule, &prio) in &grammar.rule_priorities {
+            self.priorities.insert(rule.clone(), prio);
+        }
         self
     }
 }

@@ -365,6 +365,69 @@ fn mixed_tagged() {
 }
 
 #[test]
+fn priority_annotation_round_trip() {
+    // @prio(N) parses, attaches to the right alternative, and survives
+    // into Grammar.rule_priorities keyed by canonical rule string.
+    let g = r#"
+        expr := int
+              | "(" expr ")" @prio(10)
+              | "(" expr     @prio(1)
+              | expr ")"     @prio(1) ;
+    "#;
+    let grammar = EbnfGrammarParser::new(&g, "expr")
+        .plug_terminal("int", |i| i.chars().all(|c| c.is_ascii_digit()))
+        .into_grammar()
+        .unwrap();
+
+    assert_eq!(grammar.rule_priorities.get("expr -> ( expr )"), Some(&10));
+    assert_eq!(grammar.rule_priorities.get("expr -> ( expr"), Some(&1));
+    assert_eq!(grammar.rule_priorities.get("expr -> expr )"), Some(&1));
+    // Un-annotated alternative stays absent — treated as default (0).
+    assert!(!grammar.rule_priorities.contains_key("expr -> int"));
+}
+
+#[test]
+fn priority_annotation_collapses_forest() {
+    // End-to-end: EBNF-declared priorities feed EarleyForest via
+    // with_priorities_from and collapse an ambiguous paren forest.
+    let g = r#"
+        expr := int
+              | "(" expr ")" @prio(10)
+              | "(" expr     @prio(1)
+              | expr ")"     @prio(1) ;
+    "#;
+    let grammar = EbnfGrammarParser::new(&g, "expr")
+        .plug_terminal("int", |i| i.chars().all(|c| c.is_ascii_digit()))
+        .into_grammar()
+        .unwrap();
+
+    // Without priorities: ambiguous.
+    let ef_plain = EarleyForest::new(|sym, tok| Tree::Leaf(sym.to_string(), tok.to_string()));
+    let mut ef_plain = ef_plain;
+    for rule in grammar.rules.iter().map(|r| r.to_string()) {
+        ef_plain.action(&rule.clone(), move |nodes| Tree::Node(rule.clone(), nodes));
+    }
+    let parser = EarleyParser::new(grammar.clone());
+    let pout = parser.parse(["(", "1", ")"].iter()).unwrap();
+    assert!(
+        ef_plain.eval_all(&pout).unwrap().len() >= 2,
+        "paren grammar should be ambiguous before priorities are wired"
+    );
+
+    // With priorities: forest collapses to one tree.
+    let mut ef = EarleyForest::new(|sym, tok| Tree::Leaf(sym.to_string(), tok.to_string()));
+    for rule in grammar.rules.iter().map(|r| r.to_string()) {
+        ef.action(&rule.clone(), move |nodes| Tree::Node(rule.clone(), nodes));
+    }
+    ef.with_priorities_from(&grammar);
+    assert_eq!(
+        ef.eval_all(&pout).unwrap().len(),
+        1,
+        "with_priorities_from should collapse the ambiguity"
+    );
+}
+
+#[test]
 fn plug_terminal() {
     use std::str::FromStr;
     let g = r#"

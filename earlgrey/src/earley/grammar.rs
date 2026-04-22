@@ -111,6 +111,10 @@ impl fmt::Debug for Rule {
 pub struct Grammar {
     pub start: String,
     pub rules: Vec<Rc<Rule>>,
+    /// Priorities keyed by canonical `"head -> sym1 sym2 ..."` form
+    /// matching `Rule::to_string()`. Consumed by `EarleyForest` via
+    /// `with_priorities_from`. Empty by default.
+    pub rule_priorities: HashMap<String, i32>,
 }
 
 impl fmt::Debug for Grammar {
@@ -142,6 +146,7 @@ impl fmt::Debug for Grammar {
 pub struct GrammarBuilder {
     symbols: HashMap<String, Rc<Symbol>>,
     rules: Vec<Rc<Rule>>,
+    rule_priorities: HashMap<String, i32>,
     error: Option<String>,
 }
 
@@ -215,6 +220,14 @@ impl GrammarBuilder {
         self.add_rule(head, spec, true)
     }
 
+    /// Record a priority for the rule that canonicalises to
+    /// `"head -> sym1 sym2 ..."`. Does not verify the rule exists —
+    /// callers typically add it right before/after `rule_try`.
+    pub fn rule_priority_try(&mut self, head: &str, spec: &[&str], priority: i32) {
+        let key = format!("{} -> {}", head, spec.join(" "));
+        self.rule_priorities.insert(key, priority);
+    }
+
     pub fn into_grammar(mut self, start: &str) -> Result<Grammar, String> {
         let start = start.into();
         if let Some(s) = self.symbols.get(&start) {
@@ -228,6 +241,7 @@ impl GrammarBuilder {
             Ok(Grammar {
                 start,
                 rules: self.rules,
+                rule_priorities: self.rule_priorities,
             }),
             Err,
         )

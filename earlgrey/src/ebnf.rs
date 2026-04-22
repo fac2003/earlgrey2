@@ -10,9 +10,11 @@ macro_rules! debug {
 
 #[derive(Clone, Debug)]
 enum G {
-    VariantList(Vec<Vec<String>>),
+    // Each inner entry is `(symbol-names, optional priority from @prio(N))`.
+    VariantList(Vec<(Vec<String>, Option<i32>)>),
     Variant(Vec<String>),
     Atom(String),
+    Num(i32),
     Nop,
 }
 
@@ -36,11 +38,19 @@ fn ebnf_grammar() -> Grammar {
         })
         .terminal("<Chars>", move |s| s.chars().all(|c| !c.is_control()))
         .terminal("@<Tag>", move |s| {
-            s.chars().enumerate().all(|(i, c)| {
-                i == 0 && c == '@'
-                    || i == 1 && c.is_alphabetic()
-                    || i > 1 && (c.is_alphanumeric() || c == '_')
-            })
+            // `@prio` is consumed by the priority-annotation rule below,
+            // not the generic tag rule. Exclude it here to keep the EBNF
+            // grammar unambiguous.
+            s != "@prio"
+                && s.chars().enumerate().all(|(i, c)| {
+                    i == 0 && c == '@'
+                        || i == 1 && c.is_alphabetic()
+                        || i > 1 && (c.is_alphanumeric() || c == '_')
+                })
+        })
+        .terminal("@prio", |s| s == "@prio")
+        .terminal("<Num>", |s| {
+            !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
         })
         .terminal(":=", |s| s == ":=")
         .terminal(";", |s| s == ";")
@@ -62,7 +72,15 @@ fn ebnf_grammar() -> Grammar {
         .rule("<RuleList>", &["<Rule>"])
         .rule("<Rule>", &["<Id>", ":=", "<VariantList>", ";"])
         .rule("<VariantList>", &["<VariantList>", "|", "<Variant>"])
+        .rule(
+            "<VariantList>",
+            &["<VariantList>", "|", "<Variant>", "@prio", "(", "<Num>", ")"],
+        )
         .rule("<VariantList>", &["<Variant>"])
+        .rule(
+            "<VariantList>",
+            &["<Variant>", "@prio", "(", "<Num>", ")"],
+        )
         .rule("<Variant>", &["<Variant>", "<Atom>"])
         .rule("<Variant>", &["<Atom>"])
         .rule("<Atom>", &["<Id>"])
@@ -98,6 +116,10 @@ fn ebnf_terminal_parser(
                     .borrow_mut()
                     .terminal_try(token, move |s| s == tok);
             }
+            "<Num>" => {
+                // Priority literal — lifted numerically; no grammar side effects.
+                return G::Num(token.parse().expect("BUG: <Num> tokenizer emitted non-digits"));
+            }
             _ => (),
         }
         G::Atom(token.to_string())
@@ -109,9 +131,13 @@ fn ebnf_rule_action<'a>(ev: &mut EarleyForest<'a, G>, gb: &'a RefCell<GrammarBui
         let id = pull!(G::Atom, n.remove(0));
         let body = pull!(G::VariantList, n.remove(1));
         let mut t_gb = gb.borrow_mut();
-        for rule in body {
-            debug!("Adding rule {:?} -> {:?}", id, rule);
-            t_gb.rule_try(&id, &rule.iter().map(|s| s.as_str()).collect::<Vec<&str>>());
+        for (spec, prio) in body {
+            debug!("Adding rule {:?} -> {:?} prio={:?}", id, spec, prio);
+            let spec_str: Vec<&str> = spec.iter().map(|s| s.as_str()).collect();
+            t_gb.rule_try(&id, &spec_str);
+            if let Some(p) = prio {
+                t_gb.rule_priority_try(&id, &spec_str, p);
+            }
         }
         G::Nop
     });
@@ -120,13 +146,35 @@ fn ebnf_rule_action<'a>(ev: &mut EarleyForest<'a, G>, gb: &'a RefCell<GrammarBui
 fn ebnf_variantlist_action(ev: &mut EarleyForest<'_, G>) {
     ev.action("<VariantList> -> <VariantList> | <Variant>", |mut n| {
         let mut body = pull!(G::VariantList, n.remove(0));
-        body.push(pull!(G::Variant, n.remove(1)));
+        let part = pull!(G::Variant, n.remove(1));
+        body.push((part, None));
         G::VariantList(body)
     });
+    ev.action(
+        "<VariantList> -> <VariantList> | <Variant> @prio ( <Num> )",
+        |mut n| {
+            // Spec positions: 0=VariantList 1=| 2=Variant 3=@prio 4=( 5=Num 6=)
+            // Remove highest indices first so earlier positions stay stable.
+            let prio = pull!(G::Num, n.remove(5));
+            let part = pull!(G::Variant, n.remove(2));
+            let mut body = pull!(G::VariantList, n.remove(0));
+            body.push((part, Some(prio)));
+            G::VariantList(body)
+        },
+    );
     ev.action("<VariantList> -> <Variant>", |mut n| {
         let part = pull!(G::Variant, n.remove(0));
-        G::VariantList(vec![part])
+        G::VariantList(vec![(part, None)])
     });
+    ev.action(
+        "<VariantList> -> <Variant> @prio ( <Num> )",
+        |mut n| {
+            // Spec positions: 0=Variant 1=@prio 2=( 3=Num 4=)
+            let prio = pull!(G::Num, n.remove(3));
+            let part = pull!(G::Variant, n.remove(0));
+            G::VariantList(vec![(part, Some(prio))])
+        },
+    );
 }
 
 fn ebnf_variant_action(ev: &mut EarleyForest<'_, G>) {
@@ -140,6 +188,21 @@ fn ebnf_variant_action(ev: &mut EarleyForest<'_, G>) {
     });
 }
 
+fn add_aux_variants(
+    t_gb: &mut GrammarBuilder,
+    aux: &str,
+    body: Vec<(Vec<String>, Option<i32>)>,
+) {
+    for (spec, prio) in body {
+        debug!("Adding rule {:?} -> {:?} prio={:?}", aux, spec, prio);
+        let spec_str: Vec<&str> = spec.iter().map(|s| s.as_str()).collect();
+        t_gb.rule_try(aux, &spec_str);
+        if let Some(p) = prio {
+            t_gb.rule_priority_try(aux, &spec_str, p);
+        }
+    }
+}
+
 fn ebnf_grouping_action<'a>(ev: &mut EarleyForest<'a, G>, gb: &'a RefCell<GrammarBuilder>) {
     ev.action("<Atom> -> ( <VariantList> )", move |mut n| {
         let aux = gb.borrow().unique_symbol_name();
@@ -147,13 +210,7 @@ fn ebnf_grouping_action<'a>(ev: &mut EarleyForest<'a, G>, gb: &'a RefCell<Gramma
         let mut t_gb = gb.borrow_mut();
         t_gb.nonterm_try(&aux);
         let body = pull!(G::VariantList, n.remove(1));
-        for rule in body {
-            debug!("Adding rule {:?} -> {:?}", aux, rule);
-            t_gb.rule_try(
-                &aux,
-                &rule.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
-            );
-        }
+        add_aux_variants(&mut t_gb, &aux, body);
         G::Atom(aux)
     });
     ev.action("<Atom> -> ( <VariantList> ) @<Tag>", move |mut n| {
@@ -162,13 +219,7 @@ fn ebnf_grouping_action<'a>(ev: &mut EarleyForest<'a, G>, gb: &'a RefCell<Gramma
         let mut t_gb = gb.borrow_mut();
         t_gb.nonterm_try(&aux);
         let body = pull!(G::VariantList, n.remove(1));
-        for rule in body {
-            debug!("Adding rule {:?} -> {:?}", aux, rule);
-            t_gb.rule_try(
-                &aux,
-                &rule.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
-            );
-        }
+        add_aux_variants(&mut t_gb, &aux, body);
         G::Atom(aux)
     });
 }
@@ -181,15 +232,9 @@ fn ebnf_optional_action<'a>(ev: &mut EarleyForest<'a, G>, gb: &'a RefCell<Gramma
         let mut t_gb = gb.borrow_mut();
         t_gb.nonterm_try(&aux);
         let body = pull!(G::VariantList, n.remove(1));
-        for rule in body {
-            debug!("Adding rule {:?} -> {:?}", aux, rule);
-            t_gb.rule_try(
-                &aux,
-                &rule.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
-            );
-            debug!("Adding rule {:?} -> []", aux);
-            t_gb.rule_try(&aux, &[]);
-        }
+        add_aux_variants(&mut t_gb, &aux, body);
+        debug!("Adding rule {:?} -> []", aux);
+        t_gb.rule_try(&aux, &[]);
         G::Atom(aux)
     });
     ev.action("<Atom> -> [ <VariantList> ] @<Tag>", move |mut n| {
@@ -198,15 +243,9 @@ fn ebnf_optional_action<'a>(ev: &mut EarleyForest<'a, G>, gb: &'a RefCell<Gramma
         let mut t_gb = gb.borrow_mut();
         t_gb.nonterm_try(&aux);
         let body = pull!(G::VariantList, n.remove(1));
-        for rule in body {
-            debug!("Adding rule {:?} -> {:?}", aux, rule);
-            t_gb.rule_try(
-                &aux,
-                &rule.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
-            );
-            debug!("Adding rule {:?} -> []", aux);
-            t_gb.rule_try(&aux, &[]);
-        }
+        add_aux_variants(&mut t_gb, &aux, body);
+        debug!("Adding rule {:?} -> []", aux);
+        t_gb.rule_try(&aux, &[]);
         G::Atom(aux)
     });
 }
@@ -219,16 +258,16 @@ fn ebnf_repeat_action<'a>(ev: &mut EarleyForest<'a, G>, gb: &'a RefCell<GrammarB
         let mut t_gb = gb.borrow_mut();
         t_gb.nonterm_try(&aux);
         let body = pull!(G::VariantList, n.remove(1));
-        for mut rule in body {
-            rule.push(aux.clone());
-            debug!("Adding rule {:?} -> {:?}", aux, rule);
-            t_gb.rule_try(
-                &aux,
-                &rule.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
-            );
-            debug!("Adding rule {:?} -> []", aux);
-            t_gb.rule_try(&aux, &[]);
-        }
+        let body_with_tail: Vec<(Vec<String>, Option<i32>)> = body
+            .into_iter()
+            .map(|(mut spec, prio)| {
+                spec.push(aux.clone());
+                (spec, prio)
+            })
+            .collect();
+        add_aux_variants(&mut t_gb, &aux, body_with_tail);
+        debug!("Adding rule {:?} -> []", aux);
+        t_gb.rule_try(&aux, &[]);
         G::Atom(aux)
     });
     ev.action("<Atom> -> { <VariantList> } @<Tag>", move |mut n| {
@@ -238,16 +277,16 @@ fn ebnf_repeat_action<'a>(ev: &mut EarleyForest<'a, G>, gb: &'a RefCell<GrammarB
         let mut t_gb = gb.borrow_mut();
         t_gb.nonterm_try(&aux);
         let body = pull!(G::VariantList, n.remove(1));
-        for mut rule in body {
-            rule.push(aux.clone());
-            debug!("Adding rule {:?} -> {:?}", aux, rule);
-            t_gb.rule_try(
-                &aux,
-                &rule.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
-            );
-            debug!("Adding rule {:?} -> []", aux);
-            t_gb.rule_try(&aux, &[]);
-        }
+        let body_with_tail: Vec<(Vec<String>, Option<i32>)> = body
+            .into_iter()
+            .map(|(mut spec, prio)| {
+                spec.push(aux.clone());
+                (spec, prio)
+            })
+            .collect();
+        add_aux_variants(&mut t_gb, &aux, body_with_tail);
+        debug!("Adding rule {:?} -> []", aux);
+        t_gb.rule_try(&aux, &[]);
         G::Atom(aux)
     });
 }
