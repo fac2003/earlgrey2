@@ -258,7 +258,17 @@ fn earley_bottomless() {
         &evaler.eval_all_recursive(&pout).unwrap(),
         expected_trees.clone(),
     );
-    // TODO: check_trees(&evaler.eval_all(&pout).unwrap(), expected_trees.clone());
+    // Phase 1b: iterative path has no cycle tracking yet, so it terminates
+    // with a typed error instead of panicking or looping. Phase 1a (future)
+    // will make this succeed like eval_all_recursive.
+    let err = evaler
+        .eval_all(&pout)
+        .expect_err("iterative eval_all should surface a bottomless-grammar error");
+    assert!(
+        err.contains("Bottomless grammar"),
+        "unexpected error: {}",
+        err
+    );
 }
 
 #[test]
@@ -399,6 +409,138 @@ fn math_ambiguous_catalan() {
     // https://en.wikipedia.org/wiki/Associahedron
     assert_eq!(ef.eval_all_recursive(&pout).unwrap().len(), 42);
     assert_eq!(ef.eval_all(&pout).unwrap().len(), 42);
+}
+
+#[test]
+fn eval_iter_take_stops_early() {
+    // E -> E + E | n, six operands → Catalan(5) = 42 trees.
+    // eval_iter.take(3) must yield exactly 3 trees without building the rest.
+    let grammar = GrammarBuilder::default()
+        .nonterm("E")
+        .terminal("+", |n| n == "+")
+        .terminal("n", |n| "1234567890".contains(n))
+        .rule("E", &["E", "+", "E"])
+        .rule("E", &["n"])
+        .into_grammar("E")
+        .expect("Bad grammar");
+    let p = EarleyParser::new(grammar.clone());
+    let pout = p.parse("0 + 1 + 2 + 3 + 4 + 5".split_whitespace()).unwrap();
+    let ef = tree_evaler(grammar);
+
+    let taken: Result<Vec<_>, _> = ef.eval_iter(&pout).take(3).collect();
+    assert_eq!(taken.unwrap().len(), 3);
+}
+
+#[test]
+fn eval_iter_matches_eval_all() {
+    // Iterator collected in full must match the eager eval_all output
+    // element-for-element on an ambiguous grammar.
+    let grammar = GrammarBuilder::default()
+        .nonterm("E")
+        .terminal("+", |n| n == "+")
+        .terminal("n", |n| "1234567890".contains(n))
+        .rule("E", &["E", "+", "E"])
+        .rule("E", &["n"])
+        .into_grammar("E")
+        .expect("Bad grammar");
+    let p = EarleyParser::new(grammar.clone());
+    let pout = p.parse("0 + 1 + 2 + 3".split_whitespace()).unwrap();
+    let ef = tree_evaler(grammar);
+
+    let eager = ef.eval_all(&pout).unwrap();
+    let lazy: Vec<_> = ef
+        .eval_iter(&pout)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        eager.len(),
+        lazy.len(),
+        "eager and lazy tree counts differ"
+    );
+    for (a, b) in eager.iter().zip(lazy.iter()) {
+        assert_eq!(format!("{:?}", a), format!("{:?}", b));
+    }
+}
+
+#[test]
+fn eval_capped_returns_at_most_n() {
+    // Catalan(5) = 42 trees; cap at 5 and verify we get exactly 5.
+    let grammar = GrammarBuilder::default()
+        .nonterm("E")
+        .terminal("+", |n| n == "+")
+        .terminal("n", |n| "1234567890".contains(n))
+        .rule("E", &["E", "+", "E"])
+        .rule("E", &["n"])
+        .into_grammar("E")
+        .expect("Bad grammar");
+    let p = EarleyParser::new(grammar.clone());
+    let pout = p.parse("0 + 1 + 2 + 3 + 4 + 5".split_whitespace()).unwrap();
+    let ef = tree_evaler(grammar);
+
+    let capped = ef.eval_capped(&pout, 5).unwrap();
+    assert_eq!(capped.len(), 5);
+}
+
+#[test]
+fn max_steps_per_tree_triggers_error() {
+    // With a very tight step cap, even a well-formed parse should error
+    // out on the iterative walker. This exercises the configurable cap
+    // introduced in phase 3.
+    let grammar = GrammarBuilder::default()
+        .nonterm("E")
+        .terminal("+", |n| n == "+")
+        .terminal("n", |n| "1234567890".contains(n))
+        .rule("E", &["E", "+", "E"])
+        .rule("E", &["n"])
+        .into_grammar("E")
+        .expect("Bad grammar");
+    let p = EarleyParser::new(grammar.clone());
+    let pout = p.parse("0 + 1 + 2".split_whitespace()).unwrap();
+    let mut ef = tree_evaler(grammar);
+    ef.max_steps_per_tree(1);
+
+    let err = ef
+        .eval(&pout)
+        .expect_err("tight step cap should return Err");
+    assert!(
+        err.contains("max tree-walk steps"),
+        "unexpected error: {}",
+        err
+    );
+}
+
+#[test]
+fn eval_iter_is_fused_after_error() {
+    // Once an iteration returns Err, subsequent next() calls must yield None.
+    let grammar = GrammarBuilder::default()
+        .nonterm("E")
+        .nonterm("A")
+        .terminal("n", |n| n == "n")
+        .rule("E", &["A"])
+        .rule("A", &["E"])
+        .rule("A", &["n"])
+        .into_grammar("E")
+        .expect("Bad grammar");
+    let p = EarleyParser::new(grammar.clone());
+    let pout = p.parse("n".split_whitespace()).unwrap();
+    let ef = tree_evaler(grammar);
+
+    // The bottomless grammar can still yield a valid first tree (A -> n path);
+    // the Err surfaces once the iterator tries cyclic alternatives.
+    let mut iter = ef.eval_iter(&pout);
+    let mut found_err = false;
+    while let Some(r) = iter.next() {
+        if r.is_err() {
+            found_err = true;
+            break;
+        }
+    }
+    assert!(
+        found_err,
+        "expected at least one Err from the iterator on a bottomless grammar"
+    );
+    assert!(iter.next().is_none(), "iterator must be fused after Err");
+    assert!(iter.next().is_none(), "iterator must stay fused");
 }
 
 #[test]

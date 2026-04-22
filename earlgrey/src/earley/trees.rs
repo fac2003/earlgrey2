@@ -5,11 +5,21 @@ use super::spans::{Span, SpanSource};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+// Hard ceilings so cyclic ("bottomless") grammars fail fast with a typed
+// error instead of panicking or looping. Phase 3 will make these
+// configurable per-EarleyForest; phase 1a will add actual cycle detection
+// on the iterative path.
+const MAX_WALKER_RECURSION: u16 = 100;
+const MAX_EVAL_ONE_STEPS: usize = 100_000;
+
 pub struct EarleyForest<'a, ASTNode: Clone> {
     // Semantic actions to apply when a production is completed
     actions: HashMap<String, Box<dyn Fn(Vec<ASTNode>) -> ASTNode + 'a>>,
     // How to lift a 'scanned' terminal into an AST node.
     terminal_parser: Box<dyn Fn(&str, &str) -> ASTNode + 'a>,
+    // Per-tree walk step cap overriding MAX_EVAL_ONE_STEPS. `None` keeps
+    // the built-in safety net; `Some(n)` lets callers tighten or relax it.
+    max_steps_per_tree: Option<usize>,
 }
 
 impl<'a, ASTNode: Clone> EarleyForest<'a, ASTNode> {
@@ -17,12 +27,22 @@ impl<'a, ASTNode: Clone> EarleyForest<'a, ASTNode> {
         EarleyForest {
             actions: HashMap::new(),
             terminal_parser: Box::new(terminal_parser),
+            max_steps_per_tree: None,
         }
     }
 
     // Register semantic actions to act when rules are matched
     pub fn action(&mut self, rule: &str, action: impl Fn(Vec<ASTNode>) -> ASTNode + 'a) {
         self.actions.insert(rule.to_string(), Box::new(action));
+    }
+
+    /// Cap the number of tree-walk steps spent producing a single tree.
+    /// Overrides the library's built-in safety ceiling. When exceeded,
+    /// `eval_one` / `eval` / `eval_all` / `eval_iter` return `Err`
+    /// instead of continuing.
+    pub fn max_steps_per_tree(&mut self, max: usize) -> &mut Self {
+        self.max_steps_per_tree = Some(max);
+        self
     }
 }
 
@@ -52,19 +72,25 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
     // Recurse both spans transitively until they have no sources to follow.
     // They will return the 'scans' that happened along the way.
     // - If a span originates from a 'scan' then lift the text into an ASTNode.
-    fn walker(&self, root: &Rc<Span>) -> Result<Vec<ASTNode>, String> {
+    fn walker(&self, root: &Rc<Span>, level: u16) -> Result<Vec<ASTNode>, String> {
+        if level >= MAX_WALKER_RECURSION {
+            return Err(format!(
+                "Bottomless grammar: walker exceeded max recursion depth {}",
+                MAX_WALKER_RECURSION
+            ));
+        }
         let mut args = Vec::new();
         match root.sources().iter().next() {
             Some(SpanSource::Completion(source, trigger)) => {
-                args.extend(self.walker(source)?);
-                args.extend(self.walker(trigger)?);
+                args.extend(self.walker(source, level + 1)?);
+                args.extend(self.walker(trigger, level + 1)?);
             }
             Some(SpanSource::Scan(source, trigger)) => {
                 let symbol = source
                     .next_symbol()
                     .expect("BUG: missing scan trigger symbol")
                     .name();
-                args.extend(self.walker(source)?);
+                args.extend(self.walker(source, level + 1)?);
                 args.push((self.terminal_parser)(symbol, trigger));
             }
             None => (),
@@ -76,7 +102,7 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
     pub fn eval_recursive(&self, ptrees: &ParseTrees) -> Result<ASTNode, String> {
         // walker will always return a Vec of size 1 because root.complete
         Ok(self
-            .walker(ptrees.0.first().expect("BUG: ParseTrees empty"))?
+            .walker(ptrees.0.first().expect("BUG: ParseTrees empty"), 0)?
             .swap_remove(0))
     }
 
@@ -86,7 +112,12 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
         level: u16,
         mut explored: Vec<SpanSource>,
     ) -> Result<Vec<Vec<ASTNode>>, String> {
-        assert!(level < 100, "Bottomless grammar, stack blew up");
+        if level >= MAX_WALKER_RECURSION {
+            return Err(format!(
+                "Bottomless grammar: walker_all exceeded max recursion depth {}",
+                MAX_WALKER_RECURSION
+            ));
+        }
         let source = root.sources();
         if source.len() == 0 {
             return Ok(vec![self.reduce(root, Vec::new())?]);
@@ -200,8 +231,17 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
         let mut args = Vec::new();
         let mut completions = Vec::new();
         let mut spans = vec![root];
+        let mut steps: usize = 0;
+        let step_limit = self.max_steps_per_tree.unwrap_or(MAX_EVAL_ONE_STEPS);
 
         while let Some(cursor) = spans.pop() {
+            steps += 1;
+            if steps > step_limit {
+                return Err(format!(
+                    "Bottomless grammar: eval_one exceeded max tree-walk steps {}",
+                    step_limit
+                ));
+            }
             // As Earley chart is unwound keep a record of semantic actions to apply
             if cursor.complete() {
                 completions.push(cursor.clone());
@@ -260,17 +300,97 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
     }
 
     pub fn eval_all(&self, ptrees: &ParseTrees) -> Result<Vec<ASTNode>, String> {
-        let mut results = Vec::new();
-        for root in &ptrees.0 {
-            let mut fi = ForestIterator {
-                source_idx: Vec::new(),
+        self.eval_iter(ptrees).collect()
+    }
+
+    /// Enumerate at most `max_trees` parse trees, short-circuiting once the
+    /// cap is reached. Equivalent to `eval_iter(ptrees).take(max_trees).collect()`.
+    pub fn eval_capped(
+        &self,
+        ptrees: &ParseTrees,
+        max_trees: usize,
+    ) -> Result<Vec<ASTNode>, String> {
+        self.eval_iter(ptrees).take(max_trees).collect()
+    }
+}
+
+impl<'a, ASTNode: Clone> EarleyForest<'a, ASTNode> {
+    /// Lazy enumeration of all parse trees. Trees are produced one at a
+    /// time so callers can `.take(n)`, `.find(...)`, or stream results
+    /// without materializing the full (often combinatorial) forest.
+    ///
+    /// After an `Err` the iterator is fused and yields `None` forever.
+    pub fn eval_iter<'s>(
+        &'s self,
+        ptrees: &ParseTrees,
+    ) -> EarleyForestIter<'s, 'a, ASTNode>
+    where
+        'a: 's,
+    {
+        EarleyForestIter {
+            forest: self,
+            roots: ptrees.0.clone().into_iter(),
+            state: None,
+            done: false,
+        }
+    }
+}
+
+pub struct EarleyForestIter<'f, 'a: 'f, ASTNode: Clone> {
+    forest: &'f EarleyForest<'a, ASTNode>,
+    roots: std::vec::IntoIter<Rc<Span>>,
+    // (root span, walker state, whether eval_one still needs to run once
+    // before advance() is meaningful)
+    state: Option<(Rc<Span>, ForestIterator, bool)>,
+    done: bool,
+}
+
+impl<'f, 'a: 'f, ASTNode: Clone> Iterator for EarleyForestIter<'f, 'a, ASTNode> {
+    type Item = Result<ASTNode, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        loop {
+            let mut st = match self.state.take() {
+                Some(st) => st,
+                None => match self.roots.next() {
+                    None => {
+                        self.done = true;
+                        return None;
+                    }
+                    Some(r) => (
+                        r,
+                        ForestIterator {
+                            source_idx: Vec::new(),
+                        },
+                        true,
+                    ),
+                },
             };
-            let mut iterator_has_more_items = true;
-            while iterator_has_more_items {
-                results.push(self.eval_one(root.clone(), |s| fi.source_index(s))?);
-                iterator_has_more_items = fi.advance();
+            let should_yield = if st.2 {
+                st.2 = false;
+                true
+            } else {
+                st.1.advance()
+            };
+            if !should_yield {
+                // this root is exhausted; try the next one on the next loop
+                continue;
+            }
+            let root_clone = st.0.clone();
+            let result = self
+                .forest
+                .eval_one(root_clone, |s| st.1.source_index(s));
+            self.state = Some(st);
+            match result {
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+                Ok(v) => return Some(Ok(v)),
             }
         }
-        Ok(results)
     }
 }
