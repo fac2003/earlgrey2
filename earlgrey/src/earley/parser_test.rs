@@ -2,7 +2,7 @@
 
 use super::grammar::{Grammar, GrammarBuilder};
 use super::parser::EarleyParser;
-use super::trees::EarleyForest;
+use super::trees::{EarleyForest, ForestWalkError};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -265,7 +265,12 @@ fn earley_bottomless() {
         .eval_all(&pout)
         .expect_err("iterative eval_all should surface a bottomless-grammar error");
     assert!(
-        err.contains("Bottomless grammar"),
+        matches!(err, ForestWalkError::StepCapExceeded { .. }),
+        "unexpected error variant: {:?}",
+        err
+    );
+    assert!(
+        err.to_string().contains("Bottomless grammar"),
         "unexpected error: {}",
         err
     );
@@ -503,10 +508,83 @@ fn max_steps_per_tree_triggers_error() {
         .eval(&pout)
         .expect_err("tight step cap should return Err");
     assert!(
-        err.contains("max tree-walk steps"),
+        matches!(
+            err,
+            ForestWalkError::StepCapExceeded {
+                caller_configured: true,
+                limit: 1,
+            }
+        ),
+        "unexpected error variant: {:?}",
+        err
+    );
+    assert!(
+        err.to_string().contains("max tree-walk steps"),
         "unexpected error: {}",
         err
     );
+}
+
+#[test]
+fn step_cap_default_reports_not_caller_configured() {
+    // The built-in safety ceiling firing (i.e. no `max_steps_per_tree`
+    // call) must surface as `caller_configured: false` so downstream
+    // consumers can route the two cases differently.
+    let grammar = GrammarBuilder::default()
+        .nonterm("E")
+        .nonterm("A")
+        .terminal("n", |n| n == "n")
+        .rule("E", &["A"])
+        .rule("A", &["E"])
+        .rule("A", &["n"])
+        .into_grammar("E")
+        .expect("Bad grammar");
+    let p = EarleyParser::new(grammar.clone());
+    let pout = p.parse("n".split_whitespace()).unwrap();
+    let ef = tree_evaler(grammar);
+
+    // Iterator will yield the finite tree(s) then error on a cyclic path.
+    let mut saw_step_cap = None;
+    for r in ef.eval_iter(&pout) {
+        if let Err(e) = r {
+            saw_step_cap = Some(e);
+            break;
+        }
+    }
+    let err = saw_step_cap.expect("expected a step-cap error from cyclic grammar");
+    assert!(
+        matches!(
+            err,
+            ForestWalkError::StepCapExceeded {
+                caller_configured: false,
+                ..
+            }
+        ),
+        "expected caller_configured=false for default cap, got: {:?}",
+        err
+    );
+}
+
+#[test]
+fn missing_action_returns_typed_variant() {
+    // An `EarleyForest` without an `action` registered for the head rule
+    // surfaces a typed `MissingAction` variant, not a stringified error.
+    let grammar = GrammarBuilder::default()
+        .nonterm("E")
+        .terminal("n", |n| n == "n")
+        .rule("E", &["n"])
+        .into_grammar("E")
+        .expect("Bad grammar");
+    let p = EarleyParser::new(grammar.clone());
+    let pout = p.parse("n".split_whitespace()).unwrap();
+    // Build a forest that has the terminal_parser but no rule actions.
+    let ef: EarleyForest<Tree> =
+        EarleyForest::new(|sym, tok| Tree::Leaf(sym.to_string(), tok.to_string()));
+    let err = ef.eval(&pout).expect_err("no rule action registered");
+    match err {
+        ForestWalkError::MissingAction { rule } => assert_eq!(rule, "E -> n"),
+        other => panic!("expected MissingAction, got {:?}", other),
+    }
 }
 
 #[test]
