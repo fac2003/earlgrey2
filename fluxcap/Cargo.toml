@@ -9,5 +9,5 @@ repository = "https://github.com/rodolf0/tox"
 
 [dependencies]
 chrono = "0.4"
-earlgrey = { version = "0.4", path = "../earlgrey" }
+earlgrey = { version = "0.5", path = "../earlgrey" }
 kronos = { version = "0.1", path = "../kronos" }

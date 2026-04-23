@@ -1,7 +1,7 @@
 #![deny(warnings)]
 
 mod earley;
-pub use earley::{EarleyForest, EarleyParser, Grammar, GrammarBuilder};
+pub use earley::{EarleyForest, EarleyParser, ForestWalkError, Grammar, GrammarBuilder};
 
 mod ebnf;
 mod ebnf_tokenizer;

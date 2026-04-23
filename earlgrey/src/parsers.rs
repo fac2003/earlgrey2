@@ -58,5 +58,8 @@ where
     }
 
     let parser = EarleyParser::new(grammar);
-    Ok(move |tokenizer| tree_builder.eval_all(&parser.parse(tokenizer)?))
+    Ok(move |tokenizer| {
+        let pt = parser.parse(tokenizer)?;
+        tree_builder.eval_all(&pt).map_err(Into::into)
+    })
 }

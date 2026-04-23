@@ -13,6 +13,63 @@ use std::rc::Rc;
 const MAX_WALKER_RECURSION: u16 = 100;
 const MAX_EVAL_ONE_STEPS: usize = 100_000;
 
+/// Typed error returned from the public `eval_*` surface of
+/// [`EarleyForest`]. Lets callers distinguish a recoverable step-cap hit
+/// from a genuinely broken ("bottomless") grammar without string-matching
+/// on the `Display` form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForestWalkError {
+    /// The recursive walker (`eval_recursive` / `eval_all_recursive`)
+    /// exceeded `MAX_WALKER_RECURSION`. Indicates a cyclic grammar.
+    BottomlessRecursion { limit: u16 },
+
+    /// The iterative walker (`eval` / `eval_all` / `eval_iter` /
+    /// `eval_capped`) hit its per-tree step ceiling. May be a cyclic
+    /// grammar (when `max_steps_per_tree` is at the default) or a
+    /// legitimately deep parse that hit the caller's configured cap.
+    StepCapExceeded { limit: usize, caller_configured: bool },
+
+    /// Missing semantic action for a completed rule.
+    MissingAction { rule: String },
+
+    /// Fallback for any other string-shaped error the crate surfaces
+    /// internally (kept for forward-compatibility; prefer typed variants
+    /// when adding new errors).
+    Other(String),
+}
+
+impl std::fmt::Display for ForestWalkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ForestWalkError::BottomlessRecursion { limit } => write!(
+                f,
+                "Bottomless grammar: walker exceeded max recursion depth {}",
+                limit
+            ),
+            ForestWalkError::StepCapExceeded { limit, .. } => write!(
+                f,
+                "Bottomless grammar: eval_one exceeded max tree-walk steps {}",
+                limit
+            ),
+            ForestWalkError::MissingAction { rule } => {
+                write!(f, "Missing Action: {}", rule)
+            }
+            ForestWalkError::Other(s) => f.write_str(s),
+        }
+    }
+}
+
+impl std::error::Error for ForestWalkError {}
+
+// Soft-compat for existing consumers whose call chains still propagate
+// `String` errors via `?`. Lets them keep compiling without an explicit
+// `.map_err(...)` at every site; new code should prefer the typed variant.
+impl From<ForestWalkError> for String {
+    fn from(e: ForestWalkError) -> Self {
+        e.to_string()
+    }
+}
+
 pub struct EarleyForest<'a, ASTNode: Clone> {
     // Semantic actions to apply when a production is completed
     actions: HashMap<String, Box<dyn Fn(Vec<ASTNode>) -> ASTNode + 'a>>,
@@ -130,7 +187,11 @@ fn eligible_roots(
 }
 
 impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
-    fn reduce(&self, root: &Rc<Span>, args: Vec<ASTNode>) -> Result<Vec<ASTNode>, String> {
+    fn reduce(
+        &self,
+        root: &Rc<Span>,
+        args: Vec<ASTNode>,
+    ) -> Result<Vec<ASTNode>, ForestWalkError> {
         // If span is not complete, reduce is a noop passthrough
         if !root.complete() {
             return Ok(args);
@@ -138,7 +199,7 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
         // Lookup semantic action to apply based on rule name
         let rulename = root.rule.to_string();
         match self.actions.get(&rulename) {
-            None => Err(format!("Missing Action: {}", rulename)),
+            None => Err(ForestWalkError::MissingAction { rule: rulename }),
             Some(action) => {
                 if cfg!(feature = "debug") {
                     eprintln!("Reduction: {}", rulename);
@@ -155,12 +216,15 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
     // Recurse both spans transitively until they have no sources to follow.
     // They will return the 'scans' that happened along the way.
     // - If a span originates from a 'scan' then lift the text into an ASTNode.
-    fn walker(&self, root: &Rc<Span>, level: u16) -> Result<Vec<ASTNode>, String> {
+    fn walker(
+        &self,
+        root: &Rc<Span>,
+        level: u16,
+    ) -> Result<Vec<ASTNode>, ForestWalkError> {
         if level >= MAX_WALKER_RECURSION {
-            return Err(format!(
-                "Bottomless grammar: walker exceeded max recursion depth {}",
-                MAX_WALKER_RECURSION
-            ));
+            return Err(ForestWalkError::BottomlessRecursion {
+                limit: MAX_WALKER_RECURSION,
+            });
         }
         let mut args = Vec::new();
         match root.sources().iter().next() {
@@ -182,7 +246,7 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
     }
 
     // for non-ambiguous grammars this retreieves the only possible parse
-    pub fn eval_recursive(&self, ptrees: &ParseTrees) -> Result<ASTNode, String> {
+    pub fn eval_recursive(&self, ptrees: &ParseTrees) -> Result<ASTNode, ForestWalkError> {
         // walker will always return a Vec of size 1 because root.complete
         Ok(self
             .walker(ptrees.0.first().expect("BUG: ParseTrees empty"), 0)?
@@ -194,12 +258,11 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
         root: &Rc<Span>,
         level: u16,
         mut explored: Vec<SpanSource>,
-    ) -> Result<Vec<Vec<ASTNode>>, String> {
+    ) -> Result<Vec<Vec<ASTNode>>, ForestWalkError> {
         if level >= MAX_WALKER_RECURSION {
-            return Err(format!(
-                "Bottomless grammar: walker_all exceeded max recursion depth {}",
-                MAX_WALKER_RECURSION
-            ));
+            return Err(ForestWalkError::BottomlessRecursion {
+                limit: MAX_WALKER_RECURSION,
+            });
         }
         let source = root.sources();
         if source.len() == 0 {
@@ -240,7 +303,10 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
     }
 
     // Retrieves all parse trees
-    pub fn eval_all_recursive(&self, ptrees: &ParseTrees) -> Result<Vec<ASTNode>, String> {
+    pub fn eval_all_recursive(
+        &self,
+        ptrees: &ParseTrees,
+    ) -> Result<Vec<ASTNode>, ForestWalkError> {
         let mut trees = Vec::new();
         for root in &ptrees.0 {
             trees.extend(
@@ -317,20 +383,21 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
         &self,
         root: Rc<Span>,
         mut selector: impl FnMut(&Rc<Span>) -> usize,
-    ) -> Result<ASTNode, String> {
+    ) -> Result<ASTNode, ForestWalkError> {
         let mut args = Vec::new();
         let mut completions = Vec::new();
         let mut spans = vec![root];
         let mut steps: usize = 0;
+        let caller_configured = self.max_steps_per_tree.is_some();
         let step_limit = self.max_steps_per_tree.unwrap_or(MAX_EVAL_ONE_STEPS);
 
         while let Some(cursor) = spans.pop() {
             steps += 1;
             if steps > step_limit {
-                return Err(format!(
-                    "Bottomless grammar: eval_one exceeded max tree-walk steps {}",
-                    step_limit
-                ));
+                return Err(ForestWalkError::StepCapExceeded {
+                    limit: step_limit,
+                    caller_configured,
+                });
             }
             // As Earley chart is unwound keep a record of semantic actions to apply
             if cursor.complete() {
@@ -357,7 +424,9 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
                 let action = self
                     .actions
                     .get(&rulename)
-                    .ok_or(format!("Missing Action: {}", rulename))?;
+                    .ok_or_else(|| ForestWalkError::MissingAction {
+                        rule: rulename.clone(),
+                    })?;
                 args.push(action(rule_args));
             } else {
                 let span_source_idx = selector(&cursor);
@@ -384,7 +453,7 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
         Ok(args.pop().expect("BUG: mismatched reduce args"))
     }
 
-    pub fn eval(&self, ptrees: &ParseTrees) -> Result<ASTNode, String> {
+    pub fn eval(&self, ptrees: &ParseTrees) -> Result<ASTNode, ForestWalkError> {
         // Honor priorities even for the single-tree path: pick the first
         // eligible root, and at each ambiguous span pick the first
         // priority-eligible source.
@@ -402,7 +471,7 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
         })
     }
 
-    pub fn eval_all(&self, ptrees: &ParseTrees) -> Result<Vec<ASTNode>, String> {
+    pub fn eval_all(&self, ptrees: &ParseTrees) -> Result<Vec<ASTNode>, ForestWalkError> {
         self.eval_iter(ptrees).collect()
     }
 
@@ -412,7 +481,7 @@ impl<ASTNode: Clone> EarleyForest<'_, ASTNode> {
         &self,
         ptrees: &ParseTrees,
         max_trees: usize,
-    ) -> Result<Vec<ASTNode>, String> {
+    ) -> Result<Vec<ASTNode>, ForestWalkError> {
         self.eval_iter(ptrees).take(max_trees).collect()
     }
 }
@@ -450,7 +519,7 @@ pub struct EarleyForestIter<'f, 'a: 'f, ASTNode: Clone> {
 }
 
 impl<'f, 'a: 'f, ASTNode: Clone> Iterator for EarleyForestIter<'f, 'a, ASTNode> {
-    type Item = Result<ASTNode, String>;
+    type Item = Result<ASTNode, ForestWalkError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {

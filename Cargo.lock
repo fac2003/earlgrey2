@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "earlgrey"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "lexers",
  "rustyline 14.0.0",
